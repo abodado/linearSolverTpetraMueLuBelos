@@ -1,4 +1,5 @@
 #include <chrono>
+#include <sys/resource.h>
 
 #include <Teuchos_RCP.hpp>
 #include <Teuchos_ParameterList.hpp>
@@ -9,19 +10,9 @@
 #include <Tpetra_Map.hpp>
 #include <Tpetra_Vector.hpp>
 #include <Tpetra_MultiVector.hpp>
-#include <MatrixMarket_Tpetra.hpp>  // Updated to use MatrixMarket_Tpetra.hpp
 
 #include <MueLu_CreateTpetraPreconditioner.hpp>
 #include <MueLu_ParameterListInterpreter.hpp>
-#include <MueLu_CreateTpetraPreconditioner.hpp>
-#include <MueLu_Hierarchy.hpp>
-#include <MueLu_Utilities.hpp>
-
-#include <Xpetra_TpetraMultiVector.hpp>
-#include <Xpetra_TpetraMap.hpp>
-#include <Xpetra_TpetraCrsMatrix.hpp>
-#include <Xpetra_CrsMatrixWrap.hpp>
-#include <Xpetra_CrsMatrix.hpp>
 
 #include <BelosTpetraAdapter.hpp>
 #include <BelosSolverFactory.hpp>
@@ -41,41 +32,15 @@ using crsReader = Tpetra::MatrixMarket::Reader<mtx_type>;
 
 std::string mtxFileName = "A.mtx";
 std::string bFileName = "b.mtx";
-
-// Define a struct to hold convergence criteria
-struct ConvergenceCriteria {
-  int maxIterations;
-  double tolerance;
-};
-
-// Function to perform iterations and check convergence
-void iterateWithConvergenceCheck(RCP<MueLu::Hierarchy<SC, LO, GO, NO>> H,
-                                 RCP<Xpetra::Matrix<SC, LO, GO, NO>> A,
-                                 RCP<Xpetra::MultiVector<SC, LO, GO, NO>> B,
-                                 RCP<Xpetra::MultiVector<SC, LO, GO, NO>> X,
-                                 const ConvergenceCriteria& criteria) {
-  for (int i = 0; i < criteria.maxIterations; ++i) {
-    H->Iterate(*B, *X, 1);
-
-    // Calculate residual R = AX - B
-    RCP<Xpetra::MultiVector<SC, LO, GO, NO>> R = Xpetra::MultiVectorFactory<SC, LO, GO, NO>::Build(B->getMap(), 1);
-    A->apply(*X, *R);
-    R->update(-1.0, *B, 1.0);
-
-    // Compute the 2-norm of the residual
-    Teuchos::Array<Teuchos::ScalarTraits<SC>::magnitudeType> norms(1);
-    R->norm2(norms);
-    std::cout << "V-Cycle " << i + 1 << " residual norm: " << norms[0] << std::endl;
-
-    if (norms[0] < criteria.tolerance) {
-      std::cout << "Converged after " << i + 1 << " V-cycles with residual norm: " << norms[0] << std::endl;
-      break;
-    }
-  }
-}
+std::string xFileName = "x.mtx";
+std::string coordFileName = "coordinates.mtx"; // Coordinate file
 
 int main(int argc, char *argv[])
 {
+  // getrusage variables
+  struct rusage memUsage;
+  int memStatus;
+
   Teuchos::GlobalMPISession mpiSession(&argc, &argv, nullptr);
   Tpetra::ScopeGuard tpetraScope (&argc, &argv);
 
@@ -84,26 +49,52 @@ int main(int argc, char *argv[])
     const size_t myRank = comm->getRank();
 
     // Read matrix A from Matrix Market file
-    RCP<mtx_type> A = crsReader::readSparseFile(mtxFileName, comm, false);
-    RCP<const map_type> rowMap = A->getRowMap();
+    RCP<mtx_type> mA = crsReader::readSparseFile(mtxFileName, comm, false);
+    RCP<const map_type> rowMap = mA->getRowMap();
+   /*
+    // Construct a Map that puts approximately the same number of
+    // equations on each processor.
+    const GO indexBase = 0;
+    const GO numGlobalElements = 1000;
+    RCP<const map_type> map = rcp (new map_type (numGlobalElements, indexBase, comm));
 
-    A->fillComplete();
+    //const size_t numMyElements = map->getLocalNumElements ();
+    const size_t numMyElements = rowMap->getLocalNumElements ();
+    std::cout  << "My Rank: " << myRank << std::endl;
+    std::cout  << "number of elements on this process: " << numMyElements << std::endl;
+  */
+    /*
+    // Create a map
+    const GO numGlobalElements = 1000;
+    RCP<const map_type> map = Tpetra::createUniformContigMapWithNode<LO, GO, NO>(numGlobalElements, comm);
 
-    // Create multivectors for the linear system
-    RCP<multiVect_type> X = Tpetra::createMultiVector<SC>(rowMap, 1);
-    RCP<multiVect_type> B = Tpetra::createMultiVector<SC>(rowMap, 1);
+    // Create a CrsMatrix
+    RCP<mtx_type> A = Tpetra::createCrsMatrix<SC, LO, GO, NO>(map);
 
-    // Read the RHS vector B from Matrix Market file
-    if (!bFileName.empty()) {
-      B = Tpetra::MatrixMarket::Reader<multiVect_type>::readDenseFile(bFileName, rowMap->getComm(), rowMap);
-    } else {
-      B->putScalar(1.0);
-    }
+    // Fill the matrix (example: tridiagonal matrix)
+    for (GO globalRow = map->getMinGlobalIndex(); globalRow <= map->getMaxGlobalIndex(); ++globalRow) {
+      if (globalRow > 0) {
+        A->insertGlobalValues(globalRow, Teuchos::tuple(globalRow - 1), Teuchos::tuple(-1.0));
+      }
+      A->insertGlobalValues(globalRow, Teuchos::tuple(globalRow), Teuchos::tuple(2.0));
+      if (globalRow < numGlobalElements - 1) {
+        A->insertGlobalValues(globalRow, Teuchos::tuple(globalRow + 1), Teuchos::tuple(-1.0));
+      }
+    }*/
 
-    // Create MueLu preconditioner (and solver)
+    mA->fillComplete();
+
+    // Read coordinates from Matrix Market file
+    /*RCP<multiVect_type> coordinates;
+    if (!coordFileName.empty()) {
+      coordinates = Tpetra::MatrixMarket::Reader<multiVect_type>::readDenseFile(coordFileName, rowMap->getComm(), rowMap);
+    }*/
+
+    // Create MueLu preconditioner
     RCP<Teuchos::ParameterList> paramList = Teuchos::parameterList();
+
     paramList->set("verbosity", "high");
-    paramList->set("max levels", 3);
+    paramList->set("max levels", 4);
     paramList->set("coarse: max size", 5000);
     paramList->set("multigrid algorithm", "sa");
     paramList->set("sa: damping factor", 1.33);
@@ -128,86 +119,87 @@ int main(int argc, char *argv[])
     paramList->set("repartition: rebalance P and R", false);
     paramList->sublist("repartition: params").set("algorithm", "multijagged");
 
-    // MueLu as a preconditioner in Belos
-    {
-      RCP<op_type> M = MueLu::CreateTpetraPreconditioner<SC, LO, GO, NO>(A, *paramList);
+    // Get memory status
+    memStatus = getrusage(RUSAGE_SELF, &memUsage);
+    long residentMem = memUsage.ru_maxrss;
+    std::cout << "residentMem[MB]: " << residentMem/1024 << "; rank: " << myRank << std::endl;
 
-      // Set up the Belos linear problem
-      Belos::LinearProblem<SC, multiVect_type, op_type> problem(A, X, B);
-      problem.setLeftPrec(M);
-      problem.setProblem();
+    RCP<op_type> M = MueLu::CreateTpetraPreconditioner<SC, LO, GO, NO>(mA, *paramList);
 
-      // Create the Belos solver
-      Teuchos::ParameterList belosList;
-      belosList.set("Block Size", 1);
-      belosList.set("Num Blocks", 40);
-      belosList.set("Maximum Iterations", 50);
-      belosList.set("Convergence Tolerance", 1e-8);
-      belosList.set("Output Frequency", 1);
-      belosList.set("Output Style", Belos::Brief);
-      belosList.set("Verbosity", Belos::IterationDetails + Belos::TimingDetails
-                    + Belos::FinalSummary + Belos::Errors + Belos::Warnings + Belos::StatusTestDetails);
+    // Get memory status
+    memStatus = getrusage(RUSAGE_SELF, &memUsage);
+    residentMem = memUsage.ru_maxrss;
+    std::cout << "residentMem[MB]: " << residentMem/1024 << "; rank: " << myRank << std::endl;
 
-      // Set up Belos solver using Teuchos parameter list
-      Belos::BlockGmresSolMgr<SC, multiVect_type, op_type> solver(Teuchos::rcpFromRef(problem), Teuchos::rcpFromRef(belosList));
-
-      // Solve the linear system
-      Belos::ReturnType result = solver.solve();
-
-      std::string mySolnVectfile = "SolnXVect_Belos.mtx";
-      Tpetra::MatrixMarket::Writer<Tpetra::MultiVector<SC>>::writeDenseFile(mySolnVectfile, X);
-
-      if ( myRank == 0 ){
-        if (result == Belos::Converged) {
-          std::cout << "Belos with MueLu preconditioner Converged!" << std::endl;
-        } else {
-          std::cout << "Belos with MueLu preconditioner Not Converged!" << std::endl;
-        }
-      }
+    // Create multivector, X, for the linear system
+    RCP<multiVect_type> vX = Tpetra::createMultiVector<SC>(rowMap, 1);
+    // Read the X vector from Matrix Market file
+    if (!xFileName.empty()) {
+      vX = Tpetra::MatrixMarket::Reader<multiVect_type>::readDenseFile(xFileName, rowMap->getComm(), rowMap);
+    } else {
+      // Set initial X vector values to 293.15 Kelvin
+      vX->putScalar(293.15);
     }
 
-    // MueLu as a stand-alone solver with multiple V-cycles
-    /*{
-      // Convert Tpetra objects to Xpetra
-      RCP<Xpetra::TpetraCrsMatrix<SC, LO, GO, NO>> xpetra_A_tpetra = Teuchos::rcp(new Xpetra::TpetraCrsMatrix<SC, LO, GO, NO>(A));
-      RCP<Xpetra::CrsMatrix<SC, LO, GO, NO>> xpetra_A = Teuchos::rcp_dynamic_cast<Xpetra::CrsMatrix<SC, LO, GO, NO>>(xpetra_A_tpetra);
-      RCP<Xpetra::Matrix<SC, LO, GO, NO>> wrapped_A = Teuchos::rcp(new Xpetra::CrsMatrixWrap<SC, LO, GO, NO>(xpetra_A));
+    // Create multivector, B, for the linear system
+    RCP<multiVect_type> vB = Tpetra::createMultiVector<SC>(rowMap, 1);
+    // Read the RHS vector B from Matrix Market file
+    if (!bFileName.empty()) {
+      vB = Tpetra::MatrixMarket::Reader<multiVect_type>::readDenseFile(bFileName, rowMap->getComm(), rowMap);
+    } else {
+      vB->putScalar(1.0);
+    }
 
-      RCP<Xpetra::TpetraMultiVector<SC, LO, GO, NO>> xpetra_X_tpetra = Teuchos::rcp(new Xpetra::TpetraMultiVector<SC, LO, GO, NO>(X));
-      RCP<Xpetra::MultiVector<SC, LO, GO, NO>> xpetra_X = Teuchos::rcp_dynamic_cast<Xpetra::MultiVector<SC, LO, GO, NO>>(xpetra_X_tpetra);
+    // Set up the Belos linear problem
+    Belos::LinearProblem<SC, multiVect_type, op_type> problem( mA , vX, vB);
+    problem.setLeftPrec(M);
+    problem.setProblem();
 
-      RCP<Xpetra::TpetraMultiVector<SC, LO, GO, NO>> xpetra_B_tpetra = Teuchos::rcp(new Xpetra::TpetraMultiVector<SC, LO, GO, NO>(B));
-      RCP<Xpetra::MultiVector<SC, LO, GO, NO>> xpetra_B = Teuchos::rcp_dynamic_cast<Xpetra::MultiVector<SC, LO, GO, NO>>(xpetra_B_tpetra);
+    // Create the Belos solver
+    Teuchos::ParameterList belosList;
+    belosList.set("Block Size", 1);
+    belosList.set("Num Blocks", 40);
+    belosList.set("Maximum Iterations", 50);
+    belosList.set("Convergence Tolerance", 1e-8);
+    belosList.set("Output Frequency", 1);
+    belosList.set("Output Style", Belos::Brief);
+    belosList.set("Verbosity", Belos::IterationDetails +
+                  Belos::TimingDetails + Belos::FinalSummary +
+                  Belos::Errors + Belos::Warnings + Belos::StatusTestDetails);
 
-      // Ensure all RCPs are valid
-      if (wrapped_A.is_null() || xpetra_X.is_null() || xpetra_B.is_null()) {
-        std::cerr << "Error: Null RCP encountered during conversion to Xpetra" << std::endl;
-        return EXIT_FAILURE;
-      }
+    // Set up Belos solver using Teuchos parameter list
+    Belos::BlockGmresSolMgr<SC, multiVect_type, op_type> solver(Teuchos::rcpFromRef(problem),
+                                                                Teuchos::rcpFromRef(belosList));
 
-      // Create MueLu hierarchy
-      RCP<MueLu::Hierarchy<SC, LO, GO, NO>> H = MueLu::CreateXpetraPreconditioner<SC, LO, GO, NO>(wrapped_A, *paramList);
+    // Get memory status
+    memStatus = getrusage(RUSAGE_SELF, &memUsage);
+    residentMem = memUsage.ru_maxrss;
+    std::cout << "residentMem[MB]: " << residentMem/1024 << "; rank: " << myRank << std::endl;
 
-      // Define convergence criteria
-      ConvergenceCriteria criteria;
-      criteria.maxIterations = 50;  // Maximum number of V-cycles
-      criteria.tolerance = 1e-8;    // Convergence tolerance
+    // set up timer for solution
+    auto time_start	= std::chrono::high_resolution_clock::now();
+    // Solve the linear system
+    Belos::ReturnType result = solver.solve();
+    auto time_end	= std::chrono::high_resolution_clock::now();
+    auto computeTime = std::chrono::duration_cast<std::chrono::microseconds>(time_end - time_start).count();
+    if (myRank == 0)
+      std::cout << "Solver Took: " << computeTime/1e6 << " seconds; rank: " << myRank << std::endl;
 
-      auto iterStart = std::chrono::high_resolution_clock::now();
-      // Perform iterations with convergence check
-      iterateWithConvergenceCheck(H, wrapped_A, xpetra_B, xpetra_X, criteria);
-      auto iterEnd = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(iterEnd - iterStart).count();
-      std::cout << "multigrid solver run time = " << duration << "; rank = " << myRank << std::endl;
+    // Get memory status
+    memStatus = getrusage(RUSAGE_SELF, &memUsage);
+    residentMem = memUsage.ru_maxrss;
+    std::cout << "residentMem[MB]: " << residentMem/1024 << "; rank: " << myRank << std::endl;
 
-      // Convert xpetra_X back to Tpetra::MultiVector for writing to file
-      RCP<multiVect_type> tpetra_X = Teuchos::rcp_dynamic_cast<Xpetra::TpetraMultiVector<SC, LO, GO, NO>>(xpetra_X)->getTpetra_MultiVector();
+    // Write the solution vector to a Matrix Market file
+    std::string mySolnVectfile = "SolnXVect.mtx";
+    Tpetra::MatrixMarket::Writer<Tpetra::MultiVector<SC>>::writeDenseFile(mySolnVectfile, vX);
 
-      std::string mySolnVectfile = "SolnXVect_MueLu.mtx";
-      Tpetra::MatrixMarket::Writer<Tpetra::MultiVector<SC>>::writeDenseFile(mySolnVectfile, tpetra_X);
-    }*/
+    if (result == Belos::Converged) {
+      std::cout << "Converged!" << std::endl;
+    } else {
+      std::cout << "Not Converged!" << std::endl;
+    }
   }
 
   return 0;
 }
-
